@@ -7,7 +7,7 @@ public sealed class ExecutionProcessor
 {
     private readonly Channel<ExecutionEvent> _channel;
 
-    private readonly HashSet<string> _seen = new();
+    private readonly HashSet<string> _seen = [];
     private readonly Queue<string> _seenQueue = new();
 
     private const int MaxSeen = 10_000;
@@ -74,7 +74,15 @@ public sealed class ExecutionProcessor
         _channel.Writer.TryComplete();
 
         if (_processingTask != null)
-            await _processingTask;
+        {
+            try
+            {
+                await _processingTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
 
         Console.WriteLine("[Processor] Stopped");
     }

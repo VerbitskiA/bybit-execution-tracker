@@ -21,8 +21,7 @@ internal static class Program
 
         try
         {
-            var config = LoadConfiguration();
-            ValidateConfig(config);
+            var config = LoadAndValidateConfiguration();
 
             var processor = new ExecutionProcessor();
             processor.Start();
@@ -43,17 +42,7 @@ internal static class Program
         }
     }
 
-    private static void ValidateConfig(BybitConfig config)
-    {
-        if (string.IsNullOrWhiteSpace(config.ApiKey) ||
-            string.IsNullOrWhiteSpace(config.ApiSecret))
-        {
-            throw new InvalidOperationException(
-                "ApiKey and ApiSecret must be provided.");
-        }
-    }
-
-    private static BybitConfig LoadConfiguration()
+    private static BybitConfig LoadAndValidateConfiguration()
     {
         var configuration = new ConfigurationBuilder()
             .SetBasePath(Directory.GetCurrentDirectory())
@@ -73,6 +62,13 @@ internal static class Program
             Environment.GetEnvironmentVariable("BYBIT__APISECRET")
             ?? Environment.GetEnvironmentVariable("BYBIT_APISECRET")
             ?? config.ApiSecret;
+
+        if (string.IsNullOrWhiteSpace(config.ApiKey) ||
+            string.IsNullOrWhiteSpace(config.ApiSecret))
+        {
+            throw new InvalidOperationException(
+                "ApiKey and ApiSecret must be provided.");
+        }
 
         return config;
     }
