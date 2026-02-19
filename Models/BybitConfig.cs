@@ -7,5 +7,4 @@ public class BybitConfig
     public string WebSocketUrl { get; set; } = "wss://stream.bybit.com/v5/private";
     public int ReconnectDelayMs { get; set; } = 1000;
     public int MaxReconnectDelayMs { get; set; } = 30000;
-    public int HeartbeatIntervalSeconds { get; set; } = 20;
 }

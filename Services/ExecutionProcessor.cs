@@ -1,133 +1,81 @@
-using System.Collections.Generic;
 using System.Threading.Channels;
 using BybitExecutionTracker.Models;
 
 namespace BybitExecutionTracker.Services;
 
-public class ExecutionProcessor
+public sealed class ExecutionProcessor
 {
     private readonly Channel<ExecutionEvent> _channel;
-    private readonly HashSet<string> _seenIds;
-    private readonly SortedSet<ExecutionEvent> _buffer;
-    private readonly IComparer<ExecutionEvent> _comparer;
-    private readonly CancellationTokenSource _cts;
+
+    private readonly HashSet<string> _seen = new();
+    private readonly Queue<string> _seenQueue = new();
+
+    private const int MaxSeen = 10_000;
+
     private Task? _processingTask;
-    
-    private DateTime _lastFlushTime = DateTime.UtcNow;
-    private const int FlushIntervalMs = 100;
 
     public ExecutionProcessor()
     {
-        var options = new UnboundedChannelOptions
-        {
-            SingleReader = true,
-            SingleWriter = false
-        };
-        _channel = Channel.CreateUnbounded<ExecutionEvent>(options);
-        
-        _seenIds = new HashSet<string>();
-        _comparer = Comparer<ExecutionEvent>.Create((x, y) => 
-        {
-            var timeCompare = x.SortKey.CompareTo(y.SortKey);
-            if (timeCompare != 0) return timeCompare;
-            return string.Compare(x.ExecutionId, y.ExecutionId, StringComparison.Ordinal);
-        });
-        _buffer = new SortedSet<ExecutionEvent>(_comparer);
-        _cts = new CancellationTokenSource();
+        _channel = Channel.CreateUnbounded<ExecutionEvent>(
+            new UnboundedChannelOptions
+            {
+                SingleReader = true,
+                SingleWriter = false
+            });
     }
 
     public ChannelWriter<ExecutionEvent> Writer => _channel.Writer;
 
     public void Start()
     {
-        if (_processingTask != null)
-            return;
-            
-        _processingTask = Task.Run(ProcessEvents, _cts.Token);
-        Console.WriteLine("[Processor] Started processing execution events");
+        _processingTask ??= ProcessAsync();
+        Console.WriteLine("[Processor] Started");
     }
 
-    private async Task ProcessEvents()
+    private async Task ProcessAsync()
     {
-        try
+        await foreach (var execution in _channel.Reader.ReadAllAsync())
         {
-            await foreach (var execution in _channel.Reader.ReadAllAsync(_cts.Token))
-            {
-                if (_seenIds.Contains(execution.ExecutionId))
-                {
-                    continue;
-                }
+            if (!TryDeduplicate(execution.ExecutionId))
+                continue;
 
-                _seenIds.Add(execution.ExecutionId);
-                _buffer.Add(execution);
-
-                var now = DateTime.UtcNow;
-                if ((now - _lastFlushTime).TotalMilliseconds >= FlushIntervalMs)
-                {
-                    FlushBuffer();
-                    _lastFlushTime = now;
-                }
-            }
-        }
-        catch (OperationCanceledException)
-        {
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[Processor] Error in processing loop: {ex.Message}");
-        }
-        finally
-        {
-            FlushBuffer();
+            Print(execution);
         }
     }
 
-    private void FlushBuffer()
+    private bool TryDeduplicate(string id)
     {
-        while (_buffer.Count > 0)
+        if (!_seen.Add(id))
+            return false;
+
+        _seenQueue.Enqueue(id);
+
+        if (_seenQueue.Count > MaxSeen)
         {
-            var execution = _buffer.Min;
-            if (execution != null)
-            {
-                _buffer.Remove(execution);
-                PrintExecution(execution);
-            }
-            else
-            {
-                break;
-            }
+            var oldest = _seenQueue.Dequeue();
+            _seen.Remove(oldest);
         }
+
+        return true;
     }
 
-    private void PrintExecution(ExecutionEvent execution)
+    private static void Print(in ExecutionEvent e)
     {
-        var timeStr = execution.ExecutionTime.ToString("yyyy-MM-dd HH:mm:ss");
         Console.WriteLine(
-            $"[{timeStr}] Execution ID: {execution.ExecutionId}, " +
-            $"Symbol: {execution.Symbol}, " +
-            $"Side: {execution.Side}, " +
-            $"Price: {execution.Price:F2}, " +
-            $"Qty: {execution.Qty}, " +
-            $"Time: {execution.ExecutionTime:yyyy-MM-ddTHH:mm:ss.fffZ}");
+            $"[{e.ExecutionTime:yyyy-MM-dd HH:mm:ss}] " +
+            $"Execution ID: {e.ExecutionId}, " +
+            $"Symbol: {e.Symbol}, Side: {e.Side}, " +
+            $"Price: {e.Price:F2}, Qty: {e.Qty}, " +
+            $"Time: {e.ExecutionTime:O}");
     }
 
-    public async Task Stop()
+    public async Task StopAsync()
     {
-        _channel.Writer.Complete();
-        _cts.Cancel();
-        
+        _channel.Writer.TryComplete();
+
         if (_processingTask != null)
-        {
-            try
-            {
-                await _processingTask;
-            }
-            catch (OperationCanceledException)
-            {
-            }
-        }
-        
-        FlushBuffer();
+            await _processingTask;
+
         Console.WriteLine("[Processor] Stopped");
     }
 }

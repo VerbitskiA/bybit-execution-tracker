@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Globalization;
 using System.Net.WebSockets;
 using System.Security.Cryptography;
@@ -8,64 +9,27 @@ using BybitExecutionTracker.Models;
 
 namespace BybitExecutionTracker.Services;
 
-public class BybitWebSocketService
+public sealed class BybitWebSocketService
 {
     private readonly BybitConfig _config;
-    private readonly ChannelWriter<ExecutionEvent> _eventWriter;
-    private ClientWebSocket? _webSocket;
-    private CancellationTokenSource? _cancellationTokenSource;
-    private Task? _receiveTask;
-    private Task? _heartbeatTask;
-    private bool _isAuthenticated;
-    private bool _isSubscribed;
-    private readonly object _lockObject = new object();
-    
-    private int _reconnectAttempts = 0;
-    private const int MaxReconnectAttempts = 10;
+    private readonly ChannelWriter<ExecutionEvent> _writer;
 
-    public BybitWebSocketService(BybitConfig config, ChannelWriter<ExecutionEvent> eventWriter)
+    private int _reconnectAttempts;
+
+    public BybitWebSocketService(BybitConfig config, ChannelWriter<ExecutionEvent> writer)
     {
         _config = config;
-        _eventWriter = eventWriter;
+        _writer = writer;
     }
 
-    public async Task Connect(CancellationToken cancellationToken)
+    public async Task RunAsync(CancellationToken token)
     {
-        _cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        
-        while (!_cancellationTokenSource.Token.IsCancellationRequested)
+        while (!token.IsCancellationRequested)
         {
             try
             {
-                await ConnectInternal(_cancellationTokenSource.Token);
-                
-                _heartbeatTask = Task.Run(() => HeartbeatLoop(_cancellationTokenSource.Token));
-                
-                if (_receiveTask != null)
-                {
-                    await _receiveTask;
-                }
-                
-                Console.WriteLine("[WebSocket] Connection lost, attempting reconnect...");
-                
-                lock (_lockObject)
-                {
-                    _isAuthenticated = false;
-                    _isSubscribed = false;
-                }
-                
-                if (_reconnectAttempts < MaxReconnectAttempts)
-                {
-                    var delay = CalculateReconnectDelay();
-                    Console.WriteLine($"[WebSocket] Waiting {delay}ms before reconnect (attempt {_reconnectAttempts + 1}/{MaxReconnectAttempts})");
-                    await Task.Delay(delay, _cancellationTokenSource.Token);
-                    _reconnectAttempts++;
-                }
-                else
-                {
-                    Console.WriteLine("[WebSocket] Max reconnect attempts reached");
-                    break;
-                }
+                await ConnectAndProcess(token);
+                _reconnectAttempts = 0;
             }
             catch (OperationCanceledException)
             {
@@ -73,403 +37,237 @@ public class BybitWebSocketService
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[WebSocket] Error in connection loop: {ex.Message}");
-                if (_cancellationTokenSource.Token.IsCancellationRequested)
-                    break;
-                    
-                var delay = CalculateReconnectDelay();
-                await Task.Delay(delay, _cancellationTokenSource.Token);
-                _reconnectAttempts++;
+                Console.WriteLine($"[WS] Error: {ex.Message}");
             }
+
+            var delay = CalculateBackoff();
+            Console.WriteLine($"[WS] Reconnecting in {delay}ms...");
+
+            await Task.Delay(delay, token);
         }
     }
 
-    private async Task ConnectInternal(CancellationToken cancellationToken)
+    private async Task ConnectAndProcess(CancellationToken token)
     {
-        _webSocket?.Dispose();
-        _webSocket = new ClientWebSocket();
-        
-        Console.WriteLine($"[WebSocket] Connecting to {_config.WebSocketUrl}...");
-        await _webSocket.ConnectAsync(new Uri(_config.WebSocketUrl), cancellationToken);
-        Console.WriteLine("[WebSocket] Connected");
-        
-        _reconnectAttempts = 0;
-        
-        _receiveTask = Task.Run(() => ReceiveMessages(cancellationToken));
-        
-        await Task.Delay(500, cancellationToken);
-        
-        await Authenticate(cancellationToken);
-        
-        await SubscribeToExecutions(cancellationToken);
+        using var ws = new ClientWebSocket();
+
+        Console.WriteLine("[WS] Connecting...");
+        await ws.ConnectAsync(new Uri(_config.WebSocketUrl), token);
+        Console.WriteLine("[WS] Connected");
+
+        await Authenticate(ws, token);
+        await Subscribe(ws, token);
+        await ReceiveLoop(ws, token);
     }
 
-    private async Task Authenticate(CancellationToken cancellationToken)
+    private async Task Authenticate(ClientWebSocket ws, CancellationToken token)
     {
-        if (_webSocket == null || _webSocket.State != WebSocketState.Open)
-            return;
+        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        var expires = DateTimeOffset.UtcNow.AddSeconds(5).ToUnixTimeMilliseconds();
-        var signature = GenerateSignature(expires.ToString());
-        
-        var authMessage = new
+        await Send(ws, new
         {
             op = "auth",
-            args = new[] { _config.ApiKey, expires.ToString(), signature }
-        };
-
-        var json = JsonSerializer.Serialize(authMessage);
-        var bytes = Encoding.UTF8.GetBytes(json);
-        
-        await _webSocket.SendAsync(
-            new ArraySegment<byte>(bytes),
-            WebSocketMessageType.Text,
-            true,
-            cancellationToken);
-
-        Console.WriteLine("[WebSocket] Authentication request sent");
-        
-        var timeout = Task.Delay(5000, cancellationToken);
-        var authCompleted = Task.Run(async () =>
-        {
-            while (!_isAuthenticated && !cancellationToken.IsCancellationRequested)
+            args = new[]
             {
-                await Task.Delay(100, cancellationToken);
+                _config.ApiKey,
+                GetExpires(),
+                Sign(GetExpires())
             }
-        }, cancellationToken);
-        
-        await Task.WhenAny(authCompleted, timeout);
-        
-        if (!_isAuthenticated)
-        {
-            throw new Exception("Authentication timeout - server didn't respond");
-        }
+        }, token);
+
+        _ = WaitForResponse(ws, "auth", tcs, token);
+
+        var success = await tcs.Task.WaitAsync(token);
+
+        if (!success)
+            throw new Exception("Authentication failed");
+
+        Console.WriteLine("[WS] Authenticated");
     }
 
-    private async Task SubscribeToExecutions(CancellationToken cancellationToken)
+    private static async Task Subscribe(ClientWebSocket ws, CancellationToken token)
     {
-        if (_webSocket == null || _webSocket.State != WebSocketState.Open)
-            return;
+        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        var subscribeMessage = new
+        await Send(ws, new
         {
             op = "subscribe",
             args = new[] { "execution" }
-        };
+        }, token);
 
-        var json = JsonSerializer.Serialize(subscribeMessage);
-        var bytes = Encoding.UTF8.GetBytes(json);
-        
-        await _webSocket.SendAsync(
-            new ArraySegment<byte>(bytes),
-            WebSocketMessageType.Text,
-            true,
-            cancellationToken);
+        _ = WaitForResponse(ws, "subscribe", tcs, token);
 
-        Console.WriteLine("[WebSocket] Subscription request sent");
-        
-        var timeout = Task.Delay(3000, cancellationToken);
-        var subCompleted = Task.Run(async () =>
-        {
-            while (!_isSubscribed && !cancellationToken.IsCancellationRequested)
-            {
-                await Task.Delay(100, cancellationToken);
-            }
-        }, cancellationToken);
-        
-        await Task.WhenAny(subCompleted, timeout);
+        var success = await tcs.Task.WaitAsync(token);
+
+        if (!success)
+            throw new Exception("Subscription failed");
+
+        Console.WriteLine("[WS] Subscribed");
     }
 
-    private async Task ReceiveMessages(CancellationToken cancellationToken)
+    private async Task ReceiveLoop(ClientWebSocket ws, CancellationToken token)
     {
-        if (_webSocket == null)
-            return;
+        var buffer = ArrayPool<byte>.Shared.Rent(8192);
 
-        var buffer = new byte[8192];
-        
-        while (_webSocket.State == WebSocketState.Open && !cancellationToken.IsCancellationRequested)
+        try
         {
-            try
+            while (ws.State == WebSocketState.Open && !token.IsCancellationRequested)
             {
-                var result = await _webSocket.ReceiveAsync(
-                    new ArraySegment<byte>(buffer),
-                    cancellationToken);
+                using var ms = new MemoryStream();
 
-                if (result.MessageType == WebSocketMessageType.Close)
-                {
-                    Console.WriteLine("[WebSocket] Received close message");
-                    break;
-                }
+                WebSocketReceiveResult result;
 
-                if (result.MessageType == WebSocketMessageType.Text)
+                do
                 {
-                    var message = Encoding.UTF8.GetString(buffer, 0, result.Count);
-                    await ProcessMessage(message);
-                }
+                    result = await ws.ReceiveAsync(buffer, token);
+
+                    if (result.MessageType == WebSocketMessageType.Close)
+                        throw new Exception("Socket closed");
+
+                    ms.Write(buffer, 0, result.Count);
+
+                } while (!result.EndOfMessage);
+
+                if (result.MessageType != WebSocketMessageType.Text)
+                    continue;
+
+                var json = Encoding.UTF8.GetString(ms.ToArray());
+                await HandleMessage(json, ws, token);
             }
-            catch (WebSocketException ex)
-            {
-                Console.WriteLine($"[WebSocket] WebSocket error: {ex.Message}");
-                break;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[WebSocket] Error receiving message: {ex.Message}");
-            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
         }
     }
 
-    private async Task ProcessMessage(string messageJson)
+    private async Task HandleMessage(string json, ClientWebSocket ws, CancellationToken token)
     {
-        try
+        using var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
+
+        if (root.TryGetProperty("op", out var opProp))
         {
-            Console.WriteLine($"[WebSocket] Received: {messageJson}");
-            
-            using var doc = JsonDocument.Parse(messageJson);
-            var root = doc.RootElement;
-
-            var op = root.TryGetProperty("op", out var opProp) 
-                ? opProp.GetString() 
-                : "";
-
-            if (root.TryGetProperty("success", out var success))
-            {
-                var isSuccess = success.GetBoolean();
-                var retMsg = root.TryGetProperty("ret_msg", out var retMsgProp) 
-                    ? retMsgProp.GetString() 
-                    : "";
-
-                if (op == "auth")
-                {
-                    lock (_lockObject)
-                    {
-                        _isAuthenticated = isSuccess;
-                    }
-                    if (isSuccess)
-                        Console.WriteLine("[WebSocket] Authentication successful");
-                    else
-                        Console.WriteLine($"[WebSocket] Authentication failed: {retMsg}");
-                }
-                else if (op == "subscribe")
-                {
-                    lock (_lockObject)
-                    {
-                        _isSubscribed = isSuccess;
-                    }
-                    if (isSuccess)
-                        Console.WriteLine("[WebSocket] Subscription successful");
-                    else
-                        Console.WriteLine($"[WebSocket] Subscription failed: {retMsg}");
-                }
-                return;
-            }
+            var op = opProp.GetString();
 
             if (op == "ping")
             {
-                var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString();
-                if (root.TryGetProperty("args", out var args) && args.ValueKind == JsonValueKind.Array && args.GetArrayLength() > 0)
-                {
-                    var firstArg = args[0];
-                    if (firstArg.ValueKind == JsonValueKind.String)
-                    {
-                        timestamp = firstArg.GetString() ?? timestamp;
-                    }
-                }
-                await SendPong(timestamp);
+                var args = root.TryGetProperty("args", out var argsProp) &&
+                           argsProp.ValueKind == JsonValueKind.Array
+                    ? argsProp.EnumerateArray().Select(a => a.GetString()).Where(s => s != null).ToArray()
+                    : [];
+
+                await Send(ws, new { op = "pong", args }, token);
                 return;
             }
+        }
 
-            if (root.TryGetProperty("topic", out var topic) && 
-                topic.GetString() == "execution")
+        if (root.TryGetProperty("topic", out var topicProp) &&
+            topicProp.GetString() == "execution" &&
+            root.TryGetProperty("data", out var dataProp) &&
+            dataProp.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in dataProp.EnumerateArray())
             {
-                if (root.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Array)
-                {
-                    foreach (var item in data.EnumerateArray())
-                    {
-                        var execution = ParseExecutionEvent(item);
-                        if (execution != null)
-                        {
-                            await _eventWriter.WriteAsync(execution, CancellationToken.None);
-                        }
-                    }
-                }
+                var evt = ParseExecution(item);
+                if (evt != null)
+                    await _writer.WriteAsync(evt.Value, token);
             }
-        }
-        catch (JsonException ex)
-        {
-            Console.WriteLine($"[WebSocket] JSON parse error: {ex.Message}");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[WebSocket] Error processing message: {ex.Message}");
         }
     }
 
-    private ExecutionEvent? ParseExecutionEvent(JsonElement element)
+
+    private static ExecutionEvent? ParseExecution(JsonElement e)
     {
-        try
-        {
-            var execId = element.TryGetProperty("execId", out var execIdProp) 
-                ? execIdProp.GetString() ?? "" 
-                : "";
-            var symbol = element.TryGetProperty("symbol", out var symbolProp) 
-                ? symbolProp.GetString() ?? "" 
-                : "";
-            var side = element.TryGetProperty("side", out var sideProp) 
-                ? sideProp.GetString() ?? "" 
-                : "";
-            var priceStr = element.TryGetProperty("execPrice", out var priceProp) 
-                ? priceProp.GetString() ?? "0" 
-                : "0";
-            var qtyStr = element.TryGetProperty("execQty", out var qtyProp) 
-                ? qtyProp.GetString() ?? "0" 
-                : "0";
-            var execTimeStr = element.TryGetProperty("execTime", out var execTimeProp) 
-                ? execTimeProp.GetString() ?? "" 
-                : "";
-
-            if (string.IsNullOrEmpty(execId))
-                return null;
-
-            var price = decimal.TryParse(priceStr, NumberStyles.Any, CultureInfo.InvariantCulture, out var p) ? p : 0;
-            var qty = decimal.TryParse(qtyStr, NumberStyles.Any, CultureInfo.InvariantCulture, out var q) ? q : 0;
-            
-            DateTime execTime;
-            if (long.TryParse(execTimeStr, out var timestampMs))
-            {
-                execTime = DateTimeOffset.FromUnixTimeMilliseconds(timestampMs).DateTime;
-            }
-            else
-            {
-                execTime = DateTime.UtcNow;
-            }
-
-            return new ExecutionEvent
-            {
-                ExecutionId = execId,
-                Symbol = symbol,
-                Side = side,
-                Price = price,
-                Qty = qty,
-                ExecutionTime = execTime
-            };
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[WebSocket] Error parsing execution: {ex.Message}");
+        if (!e.TryGetProperty("execId", out var idProp))
             return null;
-        }
+
+        var id = idProp.GetString();
+        if (string.IsNullOrEmpty(id))
+            return null;
+
+        decimal.TryParse(
+            e.GetProperty("execPrice").GetString(),
+            NumberStyles.Any,
+            CultureInfo.InvariantCulture,
+            out var price);
+
+        decimal.TryParse(
+            e.GetProperty("execQty").GetString(),
+            NumberStyles.Any,
+            CultureInfo.InvariantCulture,
+            out var qty);
+        
+        var execTimeStr = e.GetProperty("execTime").GetString();
+        long ts = 0;
+        if (!string.IsNullOrEmpty(execTimeStr))
+            long.TryParse(execTimeStr, out ts);
+
+        var time = DateTimeOffset.FromUnixTimeMilliseconds(ts).UtcDateTime;
+
+        return new ExecutionEvent(
+            id,
+            e.GetProperty("symbol").GetString()!,
+            e.GetProperty("side").GetString()!,
+            price,
+            qty,
+            time);
     }
 
-    private async Task HeartbeatLoop(CancellationToken cancellationToken)
+
+    private static async Task Send(ClientWebSocket ws, object payload, CancellationToken token)
     {
-        while (!cancellationToken.IsCancellationRequested && 
-               _webSocket?.State == WebSocketState.Open)
-        {
-            try
-            {
-                await Task.Delay(_config.HeartbeatIntervalSeconds * 1000, cancellationToken);
-                
-                if (_webSocket?.State == WebSocketState.Open)
-                {
-                    var pingMessage = JsonSerializer.Serialize(new { op = "ping" });
-                    var bytes = Encoding.UTF8.GetBytes(pingMessage);
-                    await _webSocket.SendAsync(
-                        new ArraySegment<byte>(bytes),
-                        WebSocketMessageType.Text,
-                        true,
-                        cancellationToken);
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[WebSocket] Heartbeat error: {ex.Message}");
-            }
-        }
+        var json = JsonSerializer.Serialize(payload);
+        var bytes = Encoding.UTF8.GetBytes(json);
+
+        await ws.SendAsync(bytes, WebSocketMessageType.Text, true, token);
     }
 
-    private async Task SendPong(string timestamp)
-    {
-        if (_webSocket == null || _webSocket.State != WebSocketState.Open)
-            return;
+    private static string GetExpires()
+        => DateTimeOffset.UtcNow.AddSeconds(5).ToUnixTimeMilliseconds().ToString();
 
-        try
-        {
-            var pongMessage = new
-            {
-                op = "pong",
-                args = new[] { timestamp }
-            };
-            var json = JsonSerializer.Serialize(pongMessage);
-            var bytes = Encoding.UTF8.GetBytes(json);
-            await _webSocket.SendAsync(
-                new ArraySegment<byte>(bytes),
-                WebSocketMessageType.Text,
-                true,
-                CancellationToken.None);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[WebSocket] Error sending pong: {ex.Message}");
-        }
-    }
-
-    private string GenerateSignature(string expires)
+    private string Sign(string expires)
     {
         var message = "GET/realtime" + expires;
         using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_config.ApiSecret));
         var hash = hmac.ComputeHash(Encoding.UTF8.GetBytes(message));
-        return BitConverter.ToString(hash).Replace("-", "").ToLower();
+        return Convert.ToHexString(hash).ToLowerInvariant();
     }
 
-    private int CalculateReconnectDelay()
+    private int CalculateBackoff()
     {
-        var delay = _config.ReconnectDelayMs * (int)Math.Pow(2, _reconnectAttempts);
+        _reconnectAttempts++;
+
+        var multiplier = 1 << Math.Min(_reconnectAttempts, 10);
+        var delay = _config.ReconnectDelayMs * multiplier;
+
         return Math.Min(delay, _config.MaxReconnectDelayMs);
     }
 
-    public async Task Disconnect()
+    private static async Task WaitForResponse(
+        ClientWebSocket ws,
+        string expectedOp,
+        TaskCompletionSource<bool> tcs,
+        CancellationToken token)
     {
-        _cancellationTokenSource?.Cancel();
-        
-        if (_receiveTask != null)
-        {
-            try
-            {
-                await _receiveTask;
-            }
-            catch { }
-        }
-        
-        if (_heartbeatTask != null)
-        {
-            try
-            {
-                await _heartbeatTask;
-            }
-            catch { }
-        }
+        var buffer = new byte[4096];
 
-        if (_webSocket != null)
+        var result = await ws.ReceiveAsync(buffer, token);
+
+        var json = Encoding.UTF8.GetString(buffer, 0, result.Count);
+
+        using var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
+
+        if (root.TryGetProperty("op", out var opProp) &&
+            root.TryGetProperty("success", out var successProp) &&
+            opProp.GetString() == expectedOp)
         {
-            if (_webSocket.State == WebSocketState.Open)
-            {
-                try
-                {
-                    await _webSocket.CloseOutputAsync(
-                        WebSocketCloseStatus.NormalClosure,
-                        "Shutting down",
-                        CancellationToken.None);
-                }
-                catch { }
-            }
-            _webSocket.Dispose();
+            tcs.TrySetResult(successProp.GetBoolean());
         }
-        
-        Console.WriteLine("[WebSocket] Disconnected");
+        else
+        {
+            tcs.TrySetResult(false);
+        }
     }
 }
