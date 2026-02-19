@@ -1,0 +1,10 @@
+{
+  "Bybit": {
+    "ApiKey": "your-api-key-here",
+    "ApiSecret": "your-api-secret-here",
+    "WebSocketUrl": "wss://stream.bybit.com/v5/private",
+    "ReconnectDelayMs": 1000,
+    "MaxReconnectDelayMs": 30000,
+    "HeartbeatIntervalSeconds": 20
+  }
+}
