@@ -6,13 +6,11 @@ namespace BybitExecutionTracker.Services;
 public sealed class ExecutionProcessor
 {
     private readonly Channel<ExecutionEvent> _channel;
-
     private readonly HashSet<string> _seen = [];
     private readonly Queue<string> _seenQueue = new();
-
     private const int MaxSeen = 10_000;
-
     private Task? _processingTask;
+    private readonly object _startLock = new();
 
     public ExecutionProcessor()
     {
@@ -26,20 +24,37 @@ public sealed class ExecutionProcessor
 
     public ChannelWriter<ExecutionEvent> Writer => _channel.Writer;
 
-    public void Start()
+    public Task StartAsync(CancellationToken ct)
     {
-        _processingTask ??= ProcessAsync();
-        Console.WriteLine("[Processor] Started");
+        lock (_startLock)
+        {
+            if (_processingTask != null)
+                return _processingTask;
+
+            _processingTask = ProcessAsync(ct);
+            Console.WriteLine("[Processor] Started");
+            return _processingTask;
+        }
     }
 
-    private async Task ProcessAsync()
+    private async Task ProcessAsync(CancellationToken ct)
     {
-        await foreach (var execution in _channel.Reader.ReadAllAsync())
+        try
         {
-            if (!TryDeduplicate(execution.ExecutionId))
-                continue;
-
-            Print(execution);
+            await foreach (var execution in _channel.Reader.ReadAllAsync(ct))
+            {
+                if (!TryDeduplicate(execution.ExecutionId))
+                    continue;
+                Print(execution);
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            Console.WriteLine("[Processor] Processing cancelled.");
+        }
+        finally
+        {
+            Console.WriteLine("[Processor] Message processing loop exited.");
         }
     }
 
@@ -49,13 +64,11 @@ public sealed class ExecutionProcessor
             return false;
 
         _seenQueue.Enqueue(id);
-
         if (_seenQueue.Count > MaxSeen)
         {
             var oldest = _seenQueue.Dequeue();
             _seen.Remove(oldest);
         }
-
         return true;
     }
 
@@ -82,8 +95,13 @@ public sealed class ExecutionProcessor
             catch (OperationCanceledException)
             {
             }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Processor] Error during shutdown: {ex.Message}");
+                throw;
+            }
         }
 
-        Console.WriteLine("[Processor] Stopped");
+        Console.WriteLine("[Processor] Stopped. All messages processed.");
     }
 }

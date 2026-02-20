@@ -62,7 +62,9 @@ public sealed class BybitWebSocketService
         await Authenticate(token);
         await Subscribe(token);
 
-        await receiveTask;
+        var heartbeatTask = HeartbeatLoop(token);
+
+        await Task.WhenAny(receiveTask, heartbeatTask);
     }
 
     private async Task Authenticate(CancellationToken token)
@@ -70,7 +72,7 @@ public sealed class BybitWebSocketService
         if (_webSocket is not { State: WebSocketState.Open })
             throw new InvalidOperationException("WebSocket is not connected");
 
-        _authTcs?.TrySetCanceled();
+        _authTcs?.TrySetCanceled(token);
         _authTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         var expires = GetExpires();
@@ -100,7 +102,7 @@ public sealed class BybitWebSocketService
         if (_webSocket is not { State: WebSocketState.Open })
             throw new InvalidOperationException("WebSocket is not connected");
 
-        _subscribeTcs?.TrySetCanceled();
+        _subscribeTcs?.TrySetCanceled(token);
         _subscribeTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         await Send(new
@@ -138,7 +140,10 @@ public sealed class BybitWebSocketService
                 {
                     result = await _webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), token);
                     if (result.MessageType == WebSocketMessageType.Close)
-                        throw new Exception($"Socket closed: {result.CloseStatus}");
+                    {
+                        Console.WriteLine($"[WS] Socket closed: {result.CloseStatus}");
+                        return;
+                    }
 
                     if (result.Count > 0)
                         ms.Write(buffer, 0, result.Count);
@@ -153,12 +158,14 @@ public sealed class BybitWebSocketService
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
-            // Ожидаемое завершение
+        }
+        catch (WebSocketException ex)
+        {
+            Console.WriteLine($"[WS] WebSocket error: {ex.Message}");
         }
         catch (Exception ex)
         {
             Console.WriteLine($"[WS] Receive error: {ex.Message}");
-            throw;
         }
         finally
         {
@@ -173,7 +180,6 @@ public sealed class BybitWebSocketService
             using var doc = JsonDocument.Parse(json);
             var root = doc.RootElement;
 
-            // Обработка auth/subscribe ответов
             if (root.TryGetProperty("op", out var opProp) &&
                 root.TryGetProperty("success", out var successProp))
             {
@@ -193,13 +199,12 @@ public sealed class BybitWebSocketService
                 }
             }
 
-            // Обработка ping
             if (root.TryGetProperty("op", out var pingOpProp))
             {
                 var op = pingOpProp.GetString();
                 if (op == "ping")
                 {
-                    var args = new string[0];
+                    var args = Array.Empty<string>();
                     if (root.TryGetProperty("args", out var argsProp) && argsProp.ValueKind == JsonValueKind.Array)
                     {
                         args = argsProp
@@ -215,7 +220,6 @@ public sealed class BybitWebSocketService
                 }
             }
 
-            // Обработка execution
             if (root.TryGetProperty("topic", out var topicProp) &&
                 topicProp.GetString() == "execution" &&
                 root.TryGetProperty("data", out var dataProp) &&
@@ -319,6 +323,31 @@ public sealed class BybitWebSocketService
         using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_config.ApiSecret));
         var hash = hmac.ComputeHash(Encoding.UTF8.GetBytes(message));
         return Convert.ToHexString(hash).ToLowerInvariant();
+    }
+
+    private async Task HeartbeatLoop(CancellationToken token)
+    {
+        while (!token.IsCancellationRequested && 
+               _webSocket?.State == WebSocketState.Open)
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(20), token);
+                
+                if (_webSocket?.State == WebSocketState.Open)
+                {
+                    await Send(new { op = "ping" }, token);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[WS] Heartbeat error: {ex.Message}");
+            }
+        }
     }
 
     private int CalculateBackoff()

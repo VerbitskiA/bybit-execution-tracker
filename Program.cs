@@ -9,65 +9,74 @@ internal static class Program
     static async Task Main(string[] args)
     {
         Console.WriteLine("Bybit Execution Tracker - Starting...");
-
+        
         using var shutdownCts = new CancellationTokenSource();
 
         Console.CancelKeyPress += (_, e) =>
         {
             e.Cancel = true;
-            Console.WriteLine("\n[Main] Shutdown requested");
+            Console.WriteLine("\n[Main] Shutdown requested (Ctrl+C)");
             shutdownCts.Cancel();
         };
 
+        ExecutionProcessor? processor = null;
+
         try
         {
-            var config = LoadAndValidateConfiguration();
+            var config = LoadConfiguration();
+            Console.WriteLine("[Main] Configuration loaded");
 
-            var processor = new ExecutionProcessor();
-            processor.Start();
+            processor = new ExecutionProcessor();
+            _ = processor.StartAsync(shutdownCts.Token);
 
             var wsService = new BybitWebSocketService(config, processor.Writer);
+            var wsTask = wsService.RunAsync(shutdownCts.Token);
 
-            await wsService.RunAsync(shutdownCts.Token);
+            Console.WriteLine("[Main] Services started. Waiting for events...");
 
-            await processor.StopAsync();
+            await wsTask;
         }
         catch (OperationCanceledException)
         {
-            Console.WriteLine("[Main] Shutdown completed");
+            Console.WriteLine("[Main] Operation cancelled.");
         }
         catch (Exception ex)
         {
             Console.WriteLine($"[Main] Fatal error: {ex}");
+            await shutdownCts.CancelAsync();
+        }
+        finally
+        {
+            if (processor != null)
+            {
+                Console.WriteLine("[Main] Stopping processor. Waiting for final messages to be processed...");
+                await processor.StopAsync();
+                Console.WriteLine("[Main] Processor stopped. Shutdown completed.");
+            }
+            else
+            {
+                Console.WriteLine("[Main] No processor to stop.");
+            }
         }
     }
 
-    private static BybitConfig LoadAndValidateConfiguration()
+    private static BybitConfig LoadConfiguration()
     {
         var configuration = new ConfigurationBuilder()
             .SetBasePath(Directory.GetCurrentDirectory())
-            .AddJsonFile("appsettings.json", optional: true)
-            .AddEnvironmentVariables()
+            .AddJsonFile("appsettings.json", optional: true, reloadOnChange: false)
+            .AddEnvironmentVariables(prefix: "BYBIT_")
             .Build();
 
         var config = new BybitConfig();
         configuration.GetSection("Bybit").Bind(config);
 
-        config.ApiKey =
-            Environment.GetEnvironmentVariable("BYBIT__APIKEY")
-            ?? Environment.GetEnvironmentVariable("BYBIT_APIKEY")
-            ?? config.ApiKey;
-
-        config.ApiSecret =
-            Environment.GetEnvironmentVariable("BYBIT__APISECRET")
-            ?? Environment.GetEnvironmentVariable("BYBIT_APISECRET")
-            ?? config.ApiSecret;
-
         if (string.IsNullOrWhiteSpace(config.ApiKey) ||
             string.IsNullOrWhiteSpace(config.ApiSecret))
         {
             throw new InvalidOperationException(
-                "ApiKey and ApiSecret must be provided.");
+                "ApiKey and ApiSecret must be provided via environment variables " +
+                "BYBIT_APIKEY/BYBIT_APISECRET or in appsettings.json under Bybit:ApiKey / Bybit:ApiSecret");
         }
 
         return config;
