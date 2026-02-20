@@ -13,7 +13,6 @@ public sealed class BybitWebSocketService
 {
     private readonly BybitConfig _config;
     private readonly ChannelWriter<ExecutionEvent> _writer;
-
     private ClientWebSocket? _webSocket;
     private int _reconnectAttempts;
     private TaskCompletionSource<bool>? _authTcs;
@@ -45,7 +44,6 @@ public sealed class BybitWebSocketService
 
             var delay = CalculateBackoff();
             Console.WriteLine($"[WS] Reconnecting in {delay}ms...");
-
             await Task.Delay(delay, token);
         }
     }
@@ -72,25 +70,29 @@ public sealed class BybitWebSocketService
         if (_webSocket is not { State: WebSocketState.Open })
             throw new InvalidOperationException("WebSocket is not connected");
 
+        _authTcs?.TrySetCanceled();
         _authTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var expires = GetExpires();
+        var signature = Sign(expires);
 
         await Send(new
         {
             op = "auth",
-            args = new[]
-            {
-                _config.ApiKey,
-                GetExpires(),
-                Sign(GetExpires())
-            }
+            args = new[] { _config.ApiKey, expires, signature }
         }, token);
 
-        var success = await _authTcs.Task.WaitAsync(TimeSpan.FromSeconds(5), token);
-
-        if (!success)
-            throw new Exception("Authentication failed");
-
-        Console.WriteLine("[WS] Authenticated");
+        try
+        {
+            var success = await _authTcs.Task.WaitAsync(TimeSpan.FromSeconds(5), token);
+            if (!success)
+                throw new Exception("Authentication rejected by server");
+            Console.WriteLine("[WS] Authenticated");
+        }
+        catch (TimeoutException)
+        {
+            throw new Exception("Authentication timeout");
+        }
     }
 
     private async Task Subscribe(CancellationToken token)
@@ -98,6 +100,7 @@ public sealed class BybitWebSocketService
         if (_webSocket is not { State: WebSocketState.Open })
             throw new InvalidOperationException("WebSocket is not connected");
 
+        _subscribeTcs?.TrySetCanceled();
         _subscribeTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         await Send(new
@@ -106,37 +109,39 @@ public sealed class BybitWebSocketService
             args = new[] { "execution" }
         }, token);
 
-        var success = await _subscribeTcs.Task.WaitAsync(TimeSpan.FromSeconds(3), token);
-
-        if (!success)
-            throw new Exception("Subscription failed");
-
-        Console.WriteLine("[WS] Subscribed");
+        try
+        {
+            var success = await _subscribeTcs.Task.WaitAsync(TimeSpan.FromSeconds(3), token);
+            if (!success)
+                throw new Exception("Subscription rejected by server");
+            Console.WriteLine("[WS] Subscribed");
+        }
+        catch (TimeoutException)
+        {
+            throw new Exception("Subscription timeout");
+        }
     }
 
     private async Task ReceiveLoop(CancellationToken token)
     {
-        if (_webSocket == null)
-            return;
+        if (_webSocket == null) return;
 
         var buffer = ArrayPool<byte>.Shared.Rent(8192);
-
         try
         {
             while (_webSocket.State == WebSocketState.Open && !token.IsCancellationRequested)
             {
                 using var ms = new MemoryStream();
-
                 WebSocketReceiveResult result;
 
                 do
                 {
-                    result = await _webSocket.ReceiveAsync(buffer, token);
-
+                    result = await _webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), token);
                     if (result.MessageType == WebSocketMessageType.Close)
-                        throw new Exception("Socket closed");
+                        throw new Exception($"Socket closed: {result.CloseStatus}");
 
-                    ms.Write(buffer, 0, result.Count);
+                    if (result.Count > 0)
+                        ms.Write(buffer, 0, result.Count);
                 } while (!result.EndOfMessage);
 
                 if (result.MessageType != WebSocketMessageType.Text)
@@ -146,12 +151,14 @@ public sealed class BybitWebSocketService
                 await HandleMessage(json, token);
             }
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
+            // Ожидаемое завершение
         }
         catch (Exception ex)
         {
             Console.WriteLine($"[WS] Receive error: {ex.Message}");
+            throw;
         }
         finally
         {
@@ -166,6 +173,7 @@ public sealed class BybitWebSocketService
             using var doc = JsonDocument.Parse(json);
             var root = doc.RootElement;
 
+            // Обработка auth/subscribe ответов
             if (root.TryGetProperty("op", out var opProp) &&
                 root.TryGetProperty("success", out var successProp))
             {
@@ -185,22 +193,29 @@ public sealed class BybitWebSocketService
                 }
             }
 
+            // Обработка ping
             if (root.TryGetProperty("op", out var pingOpProp))
             {
                 var op = pingOpProp.GetString();
-
                 if (op == "ping")
                 {
-                    var args = root.TryGetProperty("args", out var argsProp) &&
-                               argsProp.ValueKind == JsonValueKind.Array
-                        ? argsProp.EnumerateArray().Select(a => a.GetString()).Where(s => s != null).ToArray()
-                        : [];
+                    var args = new string[0];
+                    if (root.TryGetProperty("args", out var argsProp) && argsProp.ValueKind == JsonValueKind.Array)
+                    {
+                        args = argsProp
+                            .EnumerateArray()
+                            .Select(a => a.ValueKind == JsonValueKind.String ? a.GetString() : null)
+                            .Where(s => s != null)
+                            .Cast<string>()
+                            .ToArray();
+                    }
 
                     await Send(new { op = "pong", args }, token);
                     return;
                 }
             }
 
+            // Обработка execution
             if (root.TryGetProperty("topic", out var topicProp) &&
                 topicProp.GetString() == "execution" &&
                 root.TryGetProperty("data", out var dataProp) &&
@@ -209,14 +224,19 @@ public sealed class BybitWebSocketService
                 foreach (var item in dataProp.EnumerateArray())
                 {
                     var evt = ParseExecution(item);
-                    if (evt != null)
-                        await _writer.WriteAsync(evt.Value, token);
+                    if (evt.HasValue)
+                    {
+                        if (!token.IsCancellationRequested && await _writer.WaitToWriteAsync(token))
+                        {
+                            await _writer.WriteAsync(evt.Value, token);
+                        }
+                    }
                 }
             }
         }
         catch (JsonException ex)
         {
-            Console.WriteLine($"[WS] JSON parse error: {ex.Message}");
+            Console.WriteLine($"[WS] JSON parse error: {ex.Message} | JSON: {json[..Math.Min(json.Length, 200)]}...");
         }
         catch (Exception ex)
         {
@@ -233,7 +253,6 @@ public sealed class BybitWebSocketService
                 Console.WriteLine("[ParseExecution] Missing or empty execId");
                 return null;
             }
-
             var id = idProp.GetString()!;
 
             if (!e.TryGetProperty("symbol", out var symbolProp) || string.IsNullOrEmpty(symbolProp.GetString()))
@@ -241,7 +260,6 @@ public sealed class BybitWebSocketService
                 Console.WriteLine($"[ParseExecution] Missing symbol for execId={id}");
                 return null;
             }
-
             var symbol = symbolProp.GetString()!;
 
             if (!e.TryGetProperty("side", out var sideProp) || string.IsNullOrEmpty(sideProp.GetString()))
@@ -249,31 +267,30 @@ public sealed class BybitWebSocketService
                 Console.WriteLine($"[ParseExecution] Missing side for execId={id}");
                 return null;
             }
-
             var side = sideProp.GetString()!;
 
-            if (!e.TryGetProperty("execPrice", out var priceProp) || !decimal.TryParse(priceProp.GetString(),
-                    NumberStyles.Any, CultureInfo.InvariantCulture, out var price))
+            if (!e.TryGetProperty("execPrice", out var priceProp) ||
+                !decimal.TryParse(priceProp.GetString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var price))
             {
                 Console.WriteLine($"[ParseExecution] Invalid execPrice for execId={id}");
                 return null;
             }
 
-            if (!e.TryGetProperty("execQty", out var qtyProp) || !decimal.TryParse(qtyProp.GetString(),
-                    NumberStyles.Any, CultureInfo.InvariantCulture, out var qty))
+            if (!e.TryGetProperty("execQty", out var qtyProp) ||
+                !decimal.TryParse(qtyProp.GetString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var qty))
             {
                 Console.WriteLine($"[ParseExecution] Invalid execQty for execId={id}");
                 return null;
             }
 
-            if (!e.TryGetProperty("execTime", out var timeProp) || !long.TryParse(timeProp.GetString(), out var ts))
+            if (!e.TryGetProperty("execTime", out var timeProp) ||
+                !long.TryParse(timeProp.GetString(), out var ts))
             {
                 Console.WriteLine($"[ParseExecution] Invalid execTime for execId={id}");
                 return null;
             }
 
             var time = DateTimeOffset.FromUnixTimeMilliseconds(ts).UtcDateTime;
-
             return new ExecutionEvent(id, symbol, side, price, qty, time);
         }
         catch (Exception ex)
@@ -283,7 +300,6 @@ public sealed class BybitWebSocketService
         }
     }
 
-
     private async Task Send(object payload, CancellationToken token)
     {
         if (_webSocket is not { State: WebSocketState.Open })
@@ -291,8 +307,7 @@ public sealed class BybitWebSocketService
 
         var json = JsonSerializer.Serialize(payload);
         var bytes = Encoding.UTF8.GetBytes(json);
-
-        await _webSocket.SendAsync(bytes, WebSocketMessageType.Text, true, token);
+        await _webSocket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, token);
     }
 
     private static string GetExpires()
@@ -309,10 +324,8 @@ public sealed class BybitWebSocketService
     private int CalculateBackoff()
     {
         _reconnectAttempts++;
-
         var multiplier = 1 << Math.Min(_reconnectAttempts, 10);
         var delay = _config.ReconnectDelayMs * multiplier;
-
         return Math.Min(delay, _config.MaxReconnectDelayMs);
     }
 }
